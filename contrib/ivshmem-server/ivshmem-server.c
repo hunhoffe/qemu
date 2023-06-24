@@ -227,7 +227,7 @@ fail:
  * if the shm file is in a hugetlbfs that cannot be truncated to the
  * shm_size value. */
 static int
-ivshmem_server_ftruncate(int fd, unsigned shmsize)
+ivshmem_server_ftruncate(int fd, uint64_t shmsize)
 {
     int ret;
     struct stat mapstat;
@@ -239,13 +239,17 @@ ivshmem_server_ftruncate(int fd, unsigned shmsize)
         return 0;
     }
 
-    while (shmsize <= IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE) {
-        ret = ftruncate(fd, shmsize);
+    /*
+     * This is a do-while loop in case
+     * shmsize > IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE
+     */
+    do {
+        ret = ftruncate64(fd, shmsize);
         if (ret == 0) {
             return ret;
         }
         shmsize *= 2;
-    }
+    } while (shmsize <= IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE);
 
     return -1;
 }
