@@ -19,6 +19,7 @@
 #define IVSHMEM_SERVER_DEFAULT_SHM_PATH       "ivshmem"
 #define IVSHMEM_SERVER_DEFAULT_SHM_SIZE       (4 * 1024 * 1024)
 #define IVSHMEM_SERVER_DEFAULT_N_VECTORS      1
+#define IVSHMEM_SERVER_DEFAULT_NUMA_AFFINITY  0
 
 /* used to quit on signal SIGTERM */
 static int ivshmem_server_quit;
@@ -33,6 +34,8 @@ typedef struct IvshmemServerArgs {
     bool use_shm_open;
     uint64_t shm_size;
     unsigned n_vectors;
+    bool use_numa_affinity;
+    int64_t numa_affinity;
 } IvshmemServerArgs;
 
 static void
@@ -53,7 +56,8 @@ ivshmem_server_usage(const char *progname)
            "     suffixes K, M and G can be used, e.g. 1K means 1024\n"
            "     default %u\n"
            "  -n <nvectors>: number of vectors\n"
-           "     default %u\n",
+           "     default %u\n"
+	   "  -a <numa-node>: Set NUMA affinity for shared memory\n",
            progname, IVSHMEM_SERVER_DEFAULT_SHM_SIZE,
            IVSHMEM_SERVER_DEFAULT_N_VECTORS);
 }
@@ -72,7 +76,7 @@ ivshmem_server_parse_args(IvshmemServerArgs *args, int argc, char *argv[])
     uint64_t v;
     Error *err = NULL;
 
-    while ((c = getopt(argc, argv, "hvFp:S:m:M:l:n:")) != -1) {
+    while ((c = getopt(argc, argv, "hvFp:S:m:M:l:n:a:")) != -1) {
 
         switch (c) {
         case 'h': /* help */
@@ -120,6 +124,17 @@ ivshmem_server_parse_args(IvshmemServerArgs *args, int argc, char *argv[])
             args->n_vectors = v;
             break;
 
+        case 'a': /* numa affinity */
+            if (parse_uint_full(optarg, 0, &v) < 0) {
+                fprintf(stderr, "cannot parse numa_affinity\n");
+                ivshmem_server_help(argv[0]);
+                exit(1);
+            }
+            args->numa_affinity = v;
+	    args->use_numa_affinity = true;
+            break;
+
+
         default:
             ivshmem_server_usage(argv[0]);
             exit(1);
@@ -137,6 +152,12 @@ ivshmem_server_parse_args(IvshmemServerArgs *args, int argc, char *argv[])
     if (args->verbose == 1 && args->foreground == 0) {
         fprintf(stderr, "cannot use verbose in daemon mode\n");
         ivshmem_server_help(argv[0]);
+        exit(1);
+    }
+
+    int numa_max = numa_max_node();
+    if (args->numa_affinity > numa_max) {
+	fprintf(stderr, "invalid numa affinity (max is %d)\n", numa_max);
         exit(1);
     }
 }
@@ -198,6 +219,8 @@ main(int argc, char *argv[])
         .use_shm_open = true,
         .shm_size = IVSHMEM_SERVER_DEFAULT_SHM_SIZE,
         .n_vectors = IVSHMEM_SERVER_DEFAULT_N_VECTORS,
+	.use_numa_affinity = false,
+	.numa_affinity = IVSHMEM_SERVER_DEFAULT_NUMA_AFFINITY,
     };
     int ret = 1;
 
@@ -232,7 +255,8 @@ main(int argc, char *argv[])
     /* init the ivshms structure */
     if (ivshmem_server_init(&server, args.unix_socket_path,
                             args.shm_path, args.use_shm_open,
-                            args.shm_size, args.n_vectors, args.verbose) < 0) {
+                            args.shm_size, args.n_vectors, args.verbose,
+			    args.use_numa_affinity, args.numa_affinity) < 0) {
         fprintf(stderr, "cannot init server\n");
         goto err;
     }

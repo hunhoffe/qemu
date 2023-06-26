@@ -314,7 +314,7 @@ static void test_ivshmem_server(void)
 
     ret = ivshmem_server_init(&server, tmpserver, tmpshm, true,
                               TMPSHMSIZE, nvectors,
-                              g_test_verbose());
+                              g_test_verbose(), false, 0);
     g_assert_cmpint(ret, ==, 0);
 
     ret = ivshmem_server_start(&server);

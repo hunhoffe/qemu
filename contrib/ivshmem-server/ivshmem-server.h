@@ -27,6 +27,7 @@
  */
 
 #include <sys/select.h>
+#include <numa.h>
 
 #include "qemu/event_notifier.h"
 #include "qemu/queue.h"
@@ -70,6 +71,9 @@ typedef struct IvshmemServer {
     uint16_t cur_id;                 /**< id to be given to next client */
     bool verbose;                    /**< true in verbose mode */
     QTAILQ_HEAD(, IvshmemServerPeer) peer_list; /**< list of peers */
+    int numa_affinity;		     /**< the numa affinity to use */
+    bool use_numa_affinity;	     /**< use numa affinity for memory allocation */
+    char *shm_mmap;                  /**< mmap for shmem, used to force allocation */
 } IvshmemServer;
 
 /**
@@ -82,14 +86,14 @@ typedef struct IvshmemServer {
  * @shm_size:       Size of shared memory
  * @n_vectors:      Number of interrupt vectors per client
  * @verbose:        True to enable verbose mode
- *
+ * @numa_affinity   The numa affinity to use for allocation
  * Returns:         0 on success, or a negative value on error
  */
 int
 ivshmem_server_init(IvshmemServer *server, const char *unix_sock_path,
                     const char *shm_path, bool use_shm_open,
                     size_t shm_size, unsigned n_vectors,
-                    bool verbose);
+                    bool verbose, bool use_numa_affinity, int numa_affinity);
 
 /**
  * Open the shm, then create and bind to the unix socket
