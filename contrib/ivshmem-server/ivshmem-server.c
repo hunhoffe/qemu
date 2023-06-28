@@ -24,6 +24,9 @@
 /** maximum size of a huge page, used by ivshmem_server_ftruncate() */
 #define IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE (1024 * 1024 * 1024)
 
+/** minimum size of a huge page, used by ivshmem_server_numa_alloc() */
+#define IVSHMEM_SERVER_MIN_HUGEPAGE_SIZE (1024 * 1024)
+
 /** default listen backlog (number of sockets not accepted) */
 #define IVSHMEM_SERVER_LISTEN_BACKLOG 10
 
@@ -227,7 +230,7 @@ fail:
  * if the shm file is in a hugetlbfs that cannot be truncated to the
  * shm_size value. */
 static int
-ivshmem_server_ftruncate(int fd, unsigned shmsize)
+ivshmem_server_ftruncate(int fd, uint64_t shmsize)
 {
     int ret;
     struct stat mapstat;
@@ -239,15 +242,60 @@ ivshmem_server_ftruncate(int fd, unsigned shmsize)
         return 0;
     }
 
-    while (shmsize <= IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE) {
-        ret = ftruncate(fd, shmsize);
+    /*
+     * This is a do-while loop in case
+     * shmsize > IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE
+     */
+    do {
+        ret = ftruncate64(fd, shmsize);
         if (ret == 0) {
             return ret;
         }
         shmsize *= 2;
-    }
+    } while (shmsize <= IVSHMEM_SERVER_MAX_HUGEPAGE_SIZE);
 
     return -1;
+}
+
+/* Use libnuma functions (mbind, etc.) to set the memory allocation
+ * policy. Then use mmap() and touch each (large page) to ensure
+ * each page size is allocated. Then restore the memory policy. */
+static char*
+ivshmem_server_numa_alloc(int fd, uint64_t shmsize, int numa_affinity)
+{
+    char *mbuf = NULL;
+    struct bitmask *mem_mask_orig = numa_get_mems_allowed();
+    struct bitmask *mem_mask = numa_get_mems_allowed();
+
+    // Set allocation policy to specific node
+    numa_bitmask_clearall(mem_mask);
+    numa_bitmask_setbit(mem_mask, numa_affinity);
+    numa_set_membind(mem_mask);
+
+    // Have to write to force the OS to allocate the page
+    // (useful for hugetlbfs)
+    if ((mbuf = mmap(NULL, shmsize, PROT_READ | PROT_WRITE,
+				    MAP_SHARED, fd, 0)) == MAP_FAILED) {
+        fprintf(stderr, "mmap(NULL, %lx, %x, %x, %d, %d) failed: %p\n",
+                        shmsize, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0, mbuf);
+        goto numa_allocate_cleanup;
+    }
+
+    // Touch each page to force allocation
+    int index = 0;
+    while (index < shmsize) {
+        mbuf[index] = 1;
+        index += IVSHMEM_SERVER_MIN_HUGEPAGE_SIZE;
+    }
+
+    // Restore previous allocation policy
+    numa_set_membind(mem_mask_orig);
+
+numa_allocate_cleanup:
+    numa_bitmask_free(mem_mask_orig);
+    numa_bitmask_free(mem_mask);
+    return mbuf;
 }
 
 /* Init a new ivshmem server */
@@ -255,7 +303,7 @@ int
 ivshmem_server_init(IvshmemServer *server, const char *unix_sock_path,
                     const char *shm_path, bool use_shm_open,
                     size_t shm_size, unsigned n_vectors,
-                    bool verbose)
+                    bool verbose, bool use_numa_affinity, int numa_affinity)
 {
     int ret;
 
@@ -278,6 +326,8 @@ ivshmem_server_init(IvshmemServer *server, const char *unix_sock_path,
     server->use_shm_open = use_shm_open;
     server->shm_size = shm_size;
     server->n_vectors = n_vectors;
+    server->use_numa_affinity = use_numa_affinity;
+    server->numa_affinity = numa_affinity;
 
     QTAILQ_INIT(&server->peer_list);
 
@@ -297,12 +347,9 @@ ivshmem_server_start(IvshmemServer *server)
                              server->shm_path);
         shm_fd = shm_open(server->shm_path, O_CREAT | O_RDWR, S_IRWXU);
     } else {
-        gchar *filename = g_strdup_printf("%s/ivshmem.XXXXXX", server->shm_path);
         IVSHMEM_SERVER_DEBUG(server, "Using file-backed shared memory: %s\n",
                              server->shm_path);
-        shm_fd = mkstemp(filename);
-        unlink(filename);
-        g_free(filename);
+        shm_fd = open(server->shm_path, O_CREAT | O_RDWR, S_IRWXU);
     }
 
     if (shm_fd < 0) {
@@ -316,6 +363,13 @@ ivshmem_server_start(IvshmemServer *server)
         goto err_close_shm;
     }
 
+
+    if (server->use_numa_affinity && 
+		    (server->shm_mmap = ivshmem_server_numa_alloc(shm_fd,
+			    server->shm_size, server->numa_affinity)) < 0) {
+        goto err_close_shm;
+    }
+
     IVSHMEM_SERVER_DEBUG(server, "create & bind socket %s\n",
                          server->unix_sock_path);
 
@@ -324,7 +378,7 @@ ivshmem_server_start(IvshmemServer *server)
     if (sock_fd < 0) {
         IVSHMEM_SERVER_DEBUG(server, "cannot create socket: %s\n",
                              strerror(errno));
-        goto err_close_shm;
+        goto err_munmap;
     }
 
     s_un.sun_family = AF_UNIX;
@@ -352,9 +406,13 @@ ivshmem_server_start(IvshmemServer *server)
 
 err_close_sock:
     close(sock_fd);
+err_munmap:
+    munmap(server->shm_mmap, server->shm_size);
 err_close_shm:
     if (server->use_shm_open) {
         shm_unlink(server->shm_path);
+    } else {
+        remove(server->shm_path);
     }
     close(shm_fd);
     return -1;
@@ -375,6 +433,12 @@ ivshmem_server_close(IvshmemServer *server)
     unlink(server->unix_sock_path);
     if (server->use_shm_open) {
         shm_unlink(server->shm_path);
+    } else {
+        unlink(server->shm_path);
+    }
+    if (server->shm_mmap) {
+        munmap(server->shm_mmap, server->shm_size);
+        server->shm_mmap = NULL;
     }
     close(server->sock_fd);
     close(server->shm_fd);
